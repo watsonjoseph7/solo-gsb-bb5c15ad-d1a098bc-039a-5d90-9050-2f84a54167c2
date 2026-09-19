@@ -14,9 +14,24 @@ from .schemas import (
     HandoverRequest,
     HandoverResult,
     HealthOut,
+    OfferConfirmRequest,
+    OfferConfirmResult,
+    OfferCreateRequest,
+    OfferOut,
+    OfferStatusOut,
     VerifyResult,
 )
-from .service import ChainError, append_handover, create_chain, get_chain, list_chains, verify_chain
+from .service import (
+    ChainError,
+    append_handover,
+    confirm_offer,
+    create_chain,
+    create_offer,
+    get_chain,
+    get_offer,
+    list_chains,
+    verify_chain,
+)
 
 
 @asynccontextmanager
@@ -74,6 +89,56 @@ def api_handover(req: HandoverRequest) -> HandoverResult:
     return HandoverResult(
         **append_handover(req.chain_id, req.tail_hash, req.receiver, req.nonce)
     )
+
+
+@app.post(
+    "/offers",
+    response_model=OfferOut,
+    status_code=201,
+    tags=["offers"],
+    summary="发起待接收移交邀约",
+    description=(
+        "以最新链尾 tail_hash 锁定邀约，指定 receiver、有效期（秒）与一次性确认码。"
+        "服务端只保存确认码的 SHA-256 摘要，返回 offer_id 供接收方确认。"
+    ),
+)
+def api_create_offer(req: OfferCreateRequest) -> OfferOut:
+    return OfferOut(
+        **create_offer(
+            req.chain_id,
+            req.tail_hash,
+            req.receiver,
+            req.expires_in_seconds,
+            req.confirmation_code,
+        )
+    )
+
+
+@app.post(
+    "/offers/{offer_id}/confirm",
+    response_model=OfferConfirmResult,
+    status_code=201,
+    tags=["offers"],
+    summary="确认邀约（原子追加移交事件）",
+    description=(
+        "接收方凭 offer_id 与一次性确认码确认。服务端在同一 SQLite 立即事务中校验"
+        "邀约未过期、未使用且链尾仍匹配，再追加唯一移交事件并将邀约置为 accepted。"
+        "过期、重复确认或链尾已推进均返回 409，不写事件。"
+    ),
+)
+def api_confirm_offer(offer_id: str, req: OfferConfirmRequest) -> OfferConfirmResult:
+    return OfferConfirmResult(**confirm_offer(offer_id, req.confirmation_code))
+
+
+@app.get(
+    "/offers/{offer_id}",
+    response_model=OfferStatusOut,
+    tags=["offers"],
+    summary="查询单个邀约状态",
+    description="返回邀约状态（pending / accepted / expired）与确认结果，不含确认码及其摘要。",
+)
+def api_get_offer(offer_id: str) -> OfferStatusOut:
+    return OfferStatusOut(**get_offer(offer_id))
 
 
 @app.get(

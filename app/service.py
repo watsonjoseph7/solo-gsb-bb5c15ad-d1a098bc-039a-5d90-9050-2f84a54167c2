@@ -13,12 +13,20 @@
     event_hash = SHA256(canonical)
 
 交出方由服务端依据链尾持有人（current_holder）确定，客户端不能伪造。
+
+待接收移交（邀约）流程
+----------------------
+1. 持有人以最新 tail_hash 发起邀约（指定 receiver、有效期、一次性确认码），
+   服务端只保存确认码摘要并返回 offer_id；
+2. 接收方凭 offer_id + 确认码确认：在同一 SQLite 立即事务中校验邀约
+   未过期、未使用且链尾仍匹配，然后追加唯一移交事件并将邀约置为 accepted；
+3. 过期、重复确认或链尾已推进均返回 409 且不写事件。
 """
 from __future__ import annotations
 
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from .database import read_tx, write_tx
@@ -37,6 +45,19 @@ class ChainError(Exception):
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _now_dt() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_ts(value: str) -> datetime:
+    return datetime.fromisoformat(value)
+
+
+def _code_digest(code: str) -> str:
+    """一次性确认码的存储摘要：带域分隔的 SHA-256，绝不落库明文。"""
+    return digest_hex(f"offer-code:{code}")
 
 
 def _genesis_payload(file_hash: str, holder: str) -> dict[str, Any]:
@@ -121,6 +142,71 @@ def create_chain(file_hash: str, first_holder: str) -> dict[str, Any]:
     }
 
 
+def _append_handover_tx(
+    conn: sqlite3.Connection, chain: sqlite3.Row, receiver: str, nonce: str
+) -> dict[str, Any]:
+    """在已开启的写事务内向链尾追加一次移交事件并推进链头。
+
+    调用方必须已完成链尾匹配等前置校验；本函数负责算哈希、插事件、
+    更新链头，与调用方的校验同处一个事务，整体原子提交或回滚。
+    """
+    chain_id = chain["chain_id"]
+    giver = chain["current_holder"]
+    last_event = conn.execute(
+        "SELECT seq FROM events WHERE chain_id = ? ORDER BY seq DESC LIMIT 1",
+        (chain_id,),
+    ).fetchone()
+    seq = last_event["seq"] + 1
+
+    payload = _handover_payload(
+        seq=seq,
+        prev_hash=chain["tail_hash"],
+        giver=giver,
+        receiver=receiver,
+        nonce=nonce,
+    )
+    canonical = canonical_json(payload)
+    new_hash = digest_hex(canonical)
+    created_at = _now()
+
+    try:
+        conn.execute(
+            """INSERT INTO events
+               (chain_id, seq, prev_hash, giver, receiver, nonce,
+                event_hash, canonical, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (chain_id, seq, chain["tail_hash"], giver, receiver, nonce,
+             new_hash, canonical, created_at),
+        )
+    except sqlite3.IntegrityError as exc:
+        msg = str(exc)
+        if "nonce" in msg:
+            raise ChainError(
+                409, "nonce_replay", "随机数重放被拒绝（并发请求）"
+            ) from exc
+        raise ChainError(409, "conflict", f"追加冲突: {msg}") from exc
+
+    conn.execute(
+        """UPDATE chains
+           SET tail_hash = ?, current_holder = ?
+           WHERE chain_id = ?""",
+        (new_hash, receiver, chain_id),
+    )
+
+    return {
+        "chain_id": chain_id,
+        "seq": seq,
+        "prev_hash": chain["tail_hash"],
+        "giver": giver,
+        "receiver": receiver,
+        "nonce": nonce,
+        "event_hash": new_hash,
+        "canonical": canonical,
+        "tail_hash": new_hash,
+        "current_holder": receiver,
+    }
+
+
 def append_handover(
     chain_id: str, tail_hash: str, receiver: str, nonce: str
 ) -> dict[str, Any]:
@@ -155,60 +241,149 @@ def append_handover(
                 f"随机数已被使用（重放被拒绝），首次出现于序号 {dup['seq']}",
             )
 
-        giver = chain["current_holder"]
-        last_event = conn.execute(
-            "SELECT seq FROM events WHERE chain_id = ? ORDER BY seq DESC LIMIT 1",
-            (chain_id,),
+        result = _append_handover_tx(conn, chain, receiver, nonce)
+
+    return result
+
+
+def _row_to_offer(row: sqlite3.Row, now: Optional[datetime] = None) -> dict[str, Any]:
+    """邀约行 -> 对外字典。expired 是派生状态：pending 且当前时间已过有效期。"""
+    status = row["status"]
+    if status == "pending":
+        now = now or _now_dt()
+        if now > _parse_ts(row["expires_at"]):
+            status = "expired"
+    return {
+        "offer_id": row["offer_id"],
+        "chain_id": row["chain_id"],
+        "receiver": row["receiver"],
+        "status": status,
+        "expires_at": row["expires_at"],
+        "created_at": row["created_at"],
+        "accepted_at": row["accepted_at"],
+        "accepted_seq": row["accepted_seq"],
+    }
+
+
+def create_offer(
+    chain_id: str,
+    tail_hash: str,
+    receiver: str,
+    expires_in_seconds: int,
+    confirmation_code: str,
+) -> dict[str, Any]:
+    """发起待接收移交邀约。
+
+    以当前链尾 tail_hash 锁定邀约：链尾不匹配（链条已推进）返回 409，
+    邀约创建即无意义。确认码只保存 SHA-256 摘要，明文不落库。
+    """
+    with write_tx() as conn:
+        chain = conn.execute(
+            "SELECT * FROM chains WHERE chain_id = ?", (chain_id,)
         ).fetchone()
-        seq = last_event["seq"] + 1
+        if chain is None:
+            raise ChainError(404, "not_found", f"链条不存在: {chain_id}")
 
-        payload = _handover_payload(
-            seq=seq,
-            prev_hash=chain["tail_hash"],
-            giver=giver,
-            receiver=receiver,
-            nonce=nonce,
-        )
-        canonical = canonical_json(payload)
-        new_hash = digest_hex(canonical)
-        created_at = _now()
-
-        try:
-            conn.execute(
-                """INSERT INTO events
-                   (chain_id, seq, prev_hash, giver, receiver, nonce,
-                    event_hash, canonical, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (chain_id, seq, chain["tail_hash"], giver, receiver, nonce,
-                 new_hash, canonical, created_at),
+        if chain["tail_hash"] != tail_hash:
+            raise ChainError(
+                409,
+                "tail_mismatch",
+                "链尾哈希不匹配：链条已被其他移交推进，请获取最新链尾后再发起邀约",
             )
-        except sqlite3.IntegrityError as exc:
-            msg = str(exc)
-            if "nonce" in msg:
-                raise ChainError(
-                    409, "nonce_replay", "随机数重放被拒绝（并发请求）"
-                ) from exc
-            raise ChainError(409, "conflict", f"追加冲突: {msg}") from exc
+
+        offer_id = uuid.uuid4().hex
+        now = _now_dt()
+        created_at = now.isoformat(timespec="seconds")
+        expires_at = (now + timedelta(seconds=expires_in_seconds)).isoformat(
+            timespec="seconds"
+        )
 
         conn.execute(
-            """UPDATE chains
-               SET tail_hash = ?, current_holder = ?
-               WHERE chain_id = ?""",
-            (new_hash, receiver, chain_id),
+            """INSERT INTO offers
+               (offer_id, chain_id, tail_hash, receiver, code_digest,
+                status, expires_at, created_at)
+               VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)""",
+            (offer_id, chain_id, tail_hash, receiver,
+             _code_digest(confirmation_code), expires_at, created_at),
         )
 
     return {
+        "offer_id": offer_id,
         "chain_id": chain_id,
-        "seq": seq,
-        "prev_hash": chain["tail_hash"],
-        "giver": giver,
         "receiver": receiver,
-        "nonce": nonce,
-        "event_hash": new_hash,
-        "canonical": canonical,
-        "tail_hash": new_hash,
-        "current_holder": receiver,
+        "status": "pending",
+        "expires_at": expires_at,
+        "created_at": created_at,
     }
+
+
+def confirm_offer(offer_id: str, confirmation_code: str) -> dict[str, Any]:
+    """接收方凭 offer_id + 确认码确认邀约，追加唯一移交事件。
+
+    所有校验与写入在同一个 SQLite 立即事务（BEGIN IMMEDIATE）中完成：
+    校验确认码摘要 -> 邀约未过期 -> 邀约未使用 -> 链尾仍匹配，
+    然后追加移交事件、推进链头并将邀约置为 accepted，整体原子提交。
+    过期、重复确认、链尾已推进均返回 409 且整体回滚，不写任何事件。
+    """
+    with write_tx() as conn:
+        offer = conn.execute(
+            "SELECT * FROM offers WHERE offer_id = ?", (offer_id,)
+        ).fetchone()
+        if offer is None:
+            raise ChainError(404, "not_found", f"邀约不存在: {offer_id}")
+
+        if offer["code_digest"] != _code_digest(confirmation_code):
+            raise ChainError(403, "code_mismatch", "确认码不正确")
+
+        if _now_dt() > _parse_ts(offer["expires_at"]):
+            raise ChainError(
+                409, "offer_expired", "邀约已过期，请由持有人重新发起邀约"
+            )
+
+        if offer["status"] != "pending":
+            raise ChainError(
+                409, "offer_already_accepted", "邀约已被确认，不能重复使用"
+            )
+
+        chain = conn.execute(
+            "SELECT * FROM chains WHERE chain_id = ?", (offer["chain_id"],)
+        ).fetchone()
+        if chain is None:  # 外键约束下理论上不可达
+            raise ChainError(404, "not_found", f"链条不存在: {offer['chain_id']}")
+
+        if chain["tail_hash"] != offer["tail_hash"]:
+            raise ChainError(
+                409,
+                "tail_mismatch",
+                "链尾已推进：邀约所锁定的链尾不再是最新，邀约失效",
+            )
+
+        # nonce 由邀约派生，天然一次性：同一邀约不可能确认出第二个事件，
+        # 也不会与手工移交的 nonce 冲突；UNIQUE(chain_id, nonce) 兜底。
+        result = _append_handover_tx(
+            conn, chain, offer["receiver"], nonce=f"offer:{offer_id}"
+        )
+
+        conn.execute(
+            """UPDATE offers
+               SET status = 'accepted', accepted_at = ?, accepted_seq = ?
+               WHERE offer_id = ?""",
+            (_now(), result["seq"], offer_id),
+        )
+
+    result["offer_id"] = offer_id
+    return result
+
+
+def get_offer(offer_id: str) -> dict[str, Any]:
+    """查询单个邀约状态（不返回确认码及其摘要）。"""
+    with read_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM offers WHERE offer_id = ?", (offer_id,)
+        ).fetchone()
+    if row is None:
+        raise ChainError(404, "not_found", f"邀约不存在: {offer_id}")
+    return _row_to_offer(row)
 
 
 def get_chain(chain_id: str) -> dict[str, Any]:

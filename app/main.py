@@ -8,15 +8,30 @@ from fastapi.responses import JSONResponse
 
 from . import config, database
 from .schemas import (
+    AcceptOfferRequest,
     ChainOut,
     ChainSummary,
     CreateChainRequest,
+    CreateOfferRequest,
     HandoverRequest,
     HandoverResult,
     HealthOut,
+    OfferAcceptResult,
+    OfferCreatedOut,
+    OfferOut,
     VerifyResult,
 )
-from .service import ChainError, append_handover, create_chain, get_chain, list_chains, verify_chain
+from .service import (
+    ChainError,
+    accept_offer,
+    append_handover,
+    create_chain,
+    create_offer,
+    get_chain,
+    get_offer,
+    list_chains,
+    verify_chain,
+)
 
 
 @asynccontextmanager
@@ -76,6 +91,61 @@ def api_handover(req: HandoverRequest) -> HandoverResult:
     )
 
 
+@app.post(
+    "/offers",
+    response_model=OfferCreatedOut,
+    status_code=201,
+    tags=["offers"],
+    summary="发起待接收移交邀约",
+    description=(
+        "以最新链尾 tail_hash 发起邀约，指定接收方 receiver、有效期 ttl_seconds "
+        "与一次性确认码 confirm_code。服务端只保存确认码的加盐 SHA-256 摘要，"
+        "不保存明文；返回 offer_id 与到期时间。链尾不匹配返回 409。"
+    ),
+)
+def api_create_offer(req: CreateOfferRequest) -> OfferCreatedOut:
+    return OfferCreatedOut(
+        **create_offer(
+            req.chain_id,
+            req.tail_hash,
+            req.receiver,
+            req.ttl_seconds,
+            req.confirm_code,
+        )
+    )
+
+
+@app.post(
+    "/offers/{offer_id}/accept",
+    response_model=OfferAcceptResult,
+    tags=["offers"],
+    summary="确认并完成待接收移交",
+    description=(
+        "接收方凭 offer_id 与一次性确认码确认。服务端在同一个 SQLite 立即事务中"
+        "校验邀约未过期、未被使用且链尾仍匹配，然后追加唯一移交事件并将邀约置为 "
+        "accepted。过期（offer_expired）、重复确认（offer_already_accepted）、"
+        "链尾已推进（tail_mismatch）或确认码错误（offer_code_mismatch）均返回 "
+        "409 且不写入任何事件。"
+    ),
+)
+def api_accept_offer(offer_id: str, req: AcceptOfferRequest) -> OfferAcceptResult:
+    return OfferAcceptResult(**accept_offer(offer_id, req.confirm_code))
+
+
+@app.get(
+    "/offers/{offer_id}",
+    response_model=OfferOut,
+    tags=["offers"],
+    summary="查询单个邀约状态",
+    description=(
+        "返回邀约状态 pending / accepted / expired、到期时间及接受后追加的事件序号；"
+        "不会返回确认码明文或摘要。"
+    ),
+)
+def api_get_offer(offer_id: str) -> OfferOut:
+    return OfferOut(**get_offer(offer_id))
+
+
 @app.get(
     "/chains",
     response_model=list[ChainSummary],
@@ -84,7 +154,6 @@ def api_handover(req: HandoverRequest) -> HandoverResult:
 )
 def api_list_chains() -> list[ChainSummary]:
     return [ChainSummary(**c) for c in list_chains()]
-
 
 @app.get(
     "/chains/{chain_id}",

@@ -1,15 +1,20 @@
 """SQLite 持久化层。
 
-两张表：
+三张表：
 - chains：链条头信息与链尾缓存（tail_hash / current_holder 是事件表的可信投影）
 - events：链上的全部事件，序号 0 为创世记录（文件摘要 + 首位持有人），
-  序号 >=1 为移交记录。
+  序号 >=1 为移交记录（含经邀约确认后追加的移交）。
+- offers：待接收移交邀约。只保存一次性确认码的加盐 SHA-256 摘要
+  （code_digest + code_salt），绝不保存明文；邀约发起时锁定当时的链尾
+  tail_hash，确认时必须与当前链尾一致，否则视为链尾已推进而拒绝（409）。
 
 防分叉保障：
 1. 所有写操作在进程内串行锁 + SQLite `BEGIN IMMEDIATE` 中完成，
    追加前校验链尾哈希，校验与插入在同一事务内原子完成；
 2. (chain_id, seq) 唯一、(chain_id, nonce) 唯一，由数据库兜底，
-   任何竞争写入都不可能产生第二条分叉链或重放随机数。
+   任何竞争写入都不可能产生第二条分叉链或重放随机数；
+3. 邀约确认以 `status = 'pending'` 的条件更新置为 accepted 作为最终防线，
+   并发重复确认最多一方成功，失败方不写事件。
 """
 from __future__ import annotations
 
@@ -51,6 +56,25 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS idx_events_chain_seq
     ON events(chain_id, seq);
+
+CREATE TABLE IF NOT EXISTS offers (
+    offer_id      TEXT PRIMARY KEY,
+    chain_id      TEXT NOT NULL,
+    tail_hash     TEXT NOT NULL,
+    receiver      TEXT NOT NULL,
+    nonce         TEXT NOT NULL,
+    code_salt     TEXT NOT NULL,
+    code_digest   TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'pending',
+    expires_at    TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    accepted_at   TEXT NOT NULL DEFAULT '',
+    event_seq     INTEGER,
+    FOREIGN KEY(chain_id) REFERENCES chains(chain_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_offers_chain
+    ON offers(chain_id);
 """
 
 
